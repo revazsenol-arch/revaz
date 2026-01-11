@@ -1,0 +1,233 @@
+import serial
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+import numpy as np
+import collections
+import time
+
+# --- 1. AYARLAR ---
+SERIAL_PORT = 'COM3'
+BAUD_RATE = 115200     
+MAX_SAMPLES = 200      
+ALPHA = 0.15
+
+# Global Değişkenler
+OFFSET = 512.0
+MVC_VALUE = 1.0  
+is_measuring = False  
+is_calibrated = False 
+
+# Veri yapıları (GÜNCELLENDİ: SON 5 TEKRAR)
+smooth_buffer = collections.deque(maxlen=40) 
+data_queue = collections.deque([0]*MAX_SAMPLES, maxlen=MAX_SAMPLES)
+# Artık 5 eleman tutuyor
+last_5_reps = collections.deque(["--"]*5, maxlen=5)
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.001)
+    ser.flushInput()
+except Exception as e:
+    print(f"Bağlantı hatası: {e}"); exit()
+
+def calculate_rms(buffer):
+    if not buffer: return 0
+    return np.sqrt(np.mean(np.square(np.array(buffer))))
+
+# --- 2. GRAFİK ARAYÜZÜ ---
+plt.style.use('dark_background')
+fig, ax = plt.subplots(figsize=(12, 8))
+plt.subplots_adjust(bottom=0.2) 
+
+line, = ax.plot(np.arange(MAX_SAMPLES), data_queue, color='#00FF00', lw=2, animated=True)
+ax.set_ylim(-5, 105)
+ax.set_title("EMG Kas Aktivite Takibi", color='white', fontsize=14)
+
+live_text = ax.text(0.5, 0.85, '% 0', transform=ax.transAxes, ha='center', 
+                    fontsize=60, color='#00FF00', fontweight='bold', animated=True)
+
+# LİSTE ARTIK 5 SATIR
+history_text = ax.text(0.98, 0.95, 'SON 5 TEKRAR:\n1. --\n2. --\n3. --\n4. --\n5. --', transform=ax.transAxes, 
+                       ha='right', va='top', fontsize=12, color='orange', family='monospace', 
+                       bbox=dict(boxstyle='round', facecolor='black', alpha=1.0, edgecolor='#444444'), animated=True)
+
+status_text = ax.text(0.5, 0.5, 'SİSTEM HAZIR\nLütfen Kalibrasyon Yapın', transform=ax.transAxes, 
+                      ha='center', va='center', fontsize=20, color='yellow', fontweight='bold', animated=False)
+
+# --- BUTONLAR (4 ADET OLDU) ---
+# Yerleşim: [sol, alt, genişlik, yükseklik]
+ax_calib = plt.axes([0.05, 0.05, 0.2, 0.075])
+ax_start = plt.axes([0.28, 0.05, 0.2, 0.075])
+ax_pause = plt.axes([0.51, 0.05, 0.2, 0.075]) # YENİ BUTON
+ax_reset = plt.axes([0.74, 0.05, 0.2, 0.075])
+
+btn_calib = Button(ax_calib, 'KALİBRASYON', color='#333333', hovercolor='#555555')
+btn_start = Button(ax_start, 'BAŞLAT', color='#004400', hovercolor='#006600')
+btn_pause = Button(ax_pause, 'DURAKLAT', color='#995500', hovercolor='#CC7700') # YENİ BUTON
+btn_reset = Button(ax_reset, 'SIFIRLA', color='#440000', hovercolor='#660000')
+
+# --- 3. FONKSİYONLAR ---
+
+def start_calibration(event):
+    global OFFSET, MVC_VALUE, is_calibrated, is_measuring
+    is_measuring = False 
+    
+    status_text.set_text("KALİBRASYON BAŞLIYOR...\nLütfen Gevşek Bırakın")
+    status_text.set_color("cyan")
+    fig.canvas.draw()
+    plt.pause(0.1)
+    
+    time.sleep(1.5) 
+    
+    status_text.set_text("VERİ OKUNUYOR...\n(Kıpırdama)")
+    fig.canvas.draw()
+    plt.pause(0.1)
+    
+    ser.reset_input_buffer()
+    raw_samples = []
+    st = time.time()
+    while time.time() - st < 2:
+        l = ser.readline().decode('utf-8', errors='ignore').strip()
+        if l:
+            try: raw_samples.append(float(l))
+            except: pass
+    OFFSET = np.mean(raw_samples) if raw_samples else 512.0
+
+    status_text.set_text("HAZIR OLUN...\nSıkmak için Bekle")
+    status_text.set_color("yellow")
+    fig.canvas.draw()
+    plt.pause(1.0)
+    
+    status_text.set_text("!!! ŞİMDİ SIK VE TUT !!!\n(3 Saniye)")
+    status_text.set_color("red")
+    fig.canvas.draw()
+    plt.pause(0.1)
+    
+    rms_samples = []
+    temp_buffer = collections.deque(maxlen=40)
+    st = time.time()
+    while time.time() - st < 3:
+        l = ser.readline().decode('utf-8', errors='ignore').strip()
+        if l:
+            try:
+                val = float(l) - OFFSET
+                temp_buffer.append(val)
+                if len(temp_buffer) == 40:
+                    rms_samples.append(calculate_rms(temp_buffer))
+            except: pass
+            
+    if rms_samples:
+        sorted_rms = np.sort(rms_samples)
+        base_mvc = np.mean(sorted_rms[int(len(sorted_rms)*0.8):])
+        MVC_VALUE = base_mvc * 1.15 
+        if MVC_VALUE < 1: MVC_VALUE = 1
+        is_calibrated = True
+        status_text.set_text(f"KALİBRASYON TAMAM!\nMVC: {MVC_VALUE:.1f}\nBaşlat'a Basın")
+        status_text.set_color("#00FF00")
+    else:
+        status_text.set_text("HATA: Veri Gelmedi!\nTekrar Deneyin")
+        status_text.set_color("orange")
+        
+    fig.canvas.draw()
+
+def start_measurement(event):
+    global is_measuring, background 
+    
+    if is_calibrated:
+        is_measuring = True
+        status_text.set_text("") 
+        fig.canvas.draw() 
+        background = fig.canvas.copy_from_bbox(ax.bbox) 
+    else:
+        status_text.set_text("ÖNCE KALİBRE ET!")
+        status_text.set_color("red")
+        fig.canvas.draw()
+
+# --- YENİ DURAKLAT FONKSİYONU ---
+def pause_measurement(event):
+    global is_measuring
+    if is_measuring:
+        is_measuring = False # Ölçümü durdur
+        status_text.set_text("DURAKLATILDI\n(Devam için Başlat'a basın)")
+        status_text.set_color("orange")
+        fig.canvas.draw() # "Duraklatıldı" yazısını ekrana bas
+
+def reset_system(event):
+    global is_measuring, is_calibrated, data_queue, last_5_reps
+    is_measuring = False
+    is_calibrated = False
+    data_queue = collections.deque([0]*MAX_SAMPLES, maxlen=MAX_SAMPLES)
+    last_5_reps = collections.deque(["--"]*5, maxlen=5)
+    
+    line.set_ydata(data_queue)
+    live_text.set_text("% 0")
+    # Resetlerken 5 satırlık şablonu kullan
+    history_text.set_text('SON 5 TEKRAR:\n1. --\n2. --\n3. --\n4. --\n5. --')
+    status_text.set_text("SİSTEM SIFIRLANDI")
+    status_text.set_color("yellow")
+    fig.canvas.draw()
+
+btn_calib.on_clicked(start_calibration)
+btn_start.on_clicked(start_measurement)
+btn_pause.on_clicked(pause_measurement) # Butona bağla
+btn_reset.on_clicked(reset_system)
+
+# --- 4. ANA DÖNGÜ ---
+current_rep_max = 0.0
+is_active = False
+filtered_percentage = 0.0
+
+plt.show(block=False)
+plt.pause(0.1)
+background = fig.canvas.copy_from_bbox(ax.bbox)
+
+while True:
+    fig.canvas.flush_events()
+    
+    if is_measuring:
+        if ser.in_waiting > 50:
+            for _ in range(ser.in_waiting // 10): ser.readline()
+
+        line_str = ser.readline().decode('utf-8', errors='ignore').strip()
+        
+        if line_str:
+            try:
+                raw_val = float(line_str)
+                centered = raw_val - OFFSET
+                smooth_buffer.append(centered)
+                
+                rms_now = calculate_rms(smooth_buffer)
+                raw_percentage = (rms_now / MVC_VALUE) * 100
+                filtered_percentage = (ALPHA * raw_percentage) + (1 - ALPHA) * filtered_percentage
+                
+                display_val = filtered_percentage
+                if display_val > 100.0: display_val = 100.0
+                if display_val < 4.0: display_val = 0.0
+
+                if display_val > 15.0: 
+                    is_active = True
+                    if display_val > current_rep_max: current_rep_max = display_val
+                    live_text.set_text(f"% {int(display_val)}")
+                    live_text.set_color("#FF3333") 
+                else:
+                    if is_active:
+                        # GÜNCELLENDİ: 5 TEKRAR MANTIĞI
+                        last_5_reps.append(f"% {int(current_rep_max)}")
+                        h_list = list(last_5_reps)[::-1]
+                        history_text.set_text("SON 5 TEKRAR:\n" + "\n".join([f"{i+1}. {v}" for i,v in enumerate(h_list)]).strip())
+                        
+                        current_rep_max = 0.0
+                        is_active = False
+                    
+                    live_text.set_text(f"% {int(display_val)}")
+                    live_text.set_color("#00FF00") 
+
+                data_queue.append(display_val)
+                line.set_ydata(data_queue)
+
+                fig.canvas.restore_region(background)
+                ax.draw_artist(line)
+                ax.draw_artist(live_text)
+                ax.draw_artist(history_text)
+                fig.canvas.blit(ax.bbox)
+                
+            except: continue
